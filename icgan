@@ -1,0 +1,737 @@
+
+
+import os
+from pathlib import Path
+
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras import Model, layers, optimizers
+
+IMG_HEIGHT = 128
+IMG_WIDTH = 128
+
+INPUT_CHANNELS = 1
+CONDITION_CHANNELS = 2
+OUTPUT_CHANNELS = 1
+
+BATCH_SIZE = 4
+EPOCHS = 200
+
+LEARNING_RATE_G = 2e-4
+LEARNING_RATE_D = 2e-4
+BETA_1 = 0.5
+
+LAMBDA_L1 = 100.0
+LAMBDA_LOW_FREQUENCY = 10.0
+LAMBDA_EDGE = 5.0
+
+CHECKPOINT_DIR = "checkpoints"
+AUTOTUNE = tf.data.AUTOTUNE
+
+KERNEL_INITIALIZER = tf.keras.initializers.RandomNormal(
+    mean=0.0,
+    stddev=0.02,
+)
+
+BCE = tf.keras.losses.BinaryCrossentropy(from_logits=True)
+
+
+def conv_norm_act(
+    inputs,
+    filters,
+    kernel_size=3,
+    strides=1,
+    use_norm=True,
+    activation="leaky_relu",
+    name=None,
+):
+    """Conv2D + BatchNormalization + 激活函数。"""
+
+    x = layers.Conv2D(
+        filters=filters,
+        kernel_size=kernel_size,
+        strides=strides,
+        padding="same",
+        use_bias=not use_norm,
+        kernel_initializer=KERNEL_INITIALIZER,
+        name=None if name is None else f"{name}_conv",
+    )(inputs)
+
+    if use_norm:
+        x = layers.BatchNormalization(
+            momentum=0.8,
+            name=None if name is None else f"{name}_bn",
+        )(x)
+
+    if activation == "leaky_relu":
+        x = layers.LeakyReLU(
+            alpha=0.2,
+            name=None if name is None else f"{name}_lrelu",
+        )(x)
+    elif activation == "relu":
+        x = layers.ReLU(
+            name=None if name is None else f"{name}_relu",
+        )(x)
+    elif activation is None:
+        pass
+    else:
+        raise ValueError(f"不支持的激活函数：{activation}")
+
+    return x
+
+
+class ResidualBlock(layers.Layer):
+    def __init__(self, filters, **kwargs):
+        super().__init__(**kwargs)
+
+        self.conv1 = layers.Conv2D(
+            filters,
+            kernel_size=3,
+            padding="same",
+            use_bias=False,
+            kernel_initializer=KERNEL_INITIALIZER,
+        )
+        self.bn1 = layers.BatchNormalization(momentum=0.8)
+        self.relu = layers.ReLU()
+
+        self.conv2 = layers.Conv2D(
+            filters,
+            kernel_size=3,
+            padding="same",
+            use_bias=False,
+            kernel_initializer=KERNEL_INITIALIZER,
+        )
+        self.bn2 = layers.BatchNormalization(momentum=0.8)
+
+    def call(self, inputs, training=None):
+        x = self.conv1(inputs)
+        x = self.bn1(x, training=training)
+        x = self.relu(x)
+        x = self.conv2(x)
+        x = self.bn2(x, training=training)
+        return inputs + x
+
+
+def build_generator():
+    input_image = layers.Input(
+        shape=(IMG_HEIGHT, IMG_WIDTH, INPUT_CHANNELS),
+        name="generator_input_image",
+    )
+
+    condition = layers.Input(
+        shape=(IMG_HEIGHT, IMG_WIDTH, CONDITION_CHANNELS),
+        name="generator_condition",
+    )
+
+    # (128, 128, 1) + (128, 128, 2)
+    # -> (128, 128, 3)
+    fused_input = layers.Concatenate(
+        axis=-1,
+        name="generator_input_fusion",
+    )([input_image, condition])
+
+    low_1 = conv_norm_act(
+        fused_input,
+        filters=64,
+        kernel_size=7,
+        strides=1,
+        use_norm=False,
+        name="low_stem",
+    )
+    low_1 = conv_norm_act(
+        low_1,
+        filters=64,
+        kernel_size=3,
+        name="low_block_1",
+    )
+
+    low_2 = conv_norm_act(
+        low_1,
+        filters=128,
+        kernel_size=3,
+        strides=2,
+        name="low_down_1",
+    )
+    low_2 = conv_norm_act(
+        low_2,
+        filters=128,
+        kernel_size=3,
+        name="low_block_2",
+    )
+
+    low_3 = conv_norm_act(
+        low_2,
+        filters=256,
+        kernel_size=3,
+        strides=2,
+        name="low_down_2",
+    )
+    low_3 = conv_norm_act(
+        low_3,
+        filters=256,
+        kernel_size=3,
+        name="low_block_3",
+    )
+
+    high = conv_norm_act(
+        fused_input,
+        filters=64,
+        kernel_size=7,
+        strides=1,
+        use_norm=False,
+        name="high_stem",
+    )
+    high = conv_norm_act(
+        high,
+        filters=128,
+        kernel_size=3,
+        strides=2,
+        name="high_down_1",
+    )
+    high = conv_norm_act(
+        high,
+        filters=256,
+        kernel_size=3,
+        strides=2,
+        name="high_down_2",
+    )
+
+    refine = conv_norm_act(
+        high,
+        filters=116,
+        kernel_size=5,
+        strides=1,
+        name="refine_block_1",
+    )
+    refine = conv_norm_act(
+        refine,
+        filters=116,
+        kernel_size=3,
+        strides=1,
+        name="refine_block_2",
+    )
+    refine = layers.Conv2D(
+        filters=256,
+        kernel_size=1,
+        padding="same",
+        use_bias=False,
+        kernel_initializer=KERNEL_INITIALIZER,
+        name="refine_projection",
+    )(refine)
+    refine = layers.BatchNormalization(
+        momentum=0.8,
+        name="refine_projection_bn",
+    )(refine)
+    high = layers.Add(name="refine_add")([high, refine])
+
+    # 残差块
+    for i in range(6):
+        high = ResidualBlock(
+            filters=256,
+            name=f"high_residual_{i + 1}",
+        )(high)
+
+    x = layers.Concatenate(
+        axis=-1,
+        name="parallel_feature_fusion",
+    )([low_3, high])
+
+    x = conv_norm_act(
+        x,
+        filters=256,
+        kernel_size=3,
+        name="fusion_projection",
+    )
+
+    # --------------------------------------------------------
+    # 32 -> 64 -> 128
+    # --------------------------------------------------------
+
+    x = layers.UpSampling2D(
+        size=(2, 2),
+        interpolation="bilinear",
+        name="decoder_upsample_1",
+    )(x)
+    x = conv_norm_act(
+        x,
+        filters=128,
+        kernel_size=3,
+        name="decoder_up_1",
+    )
+
+    x = layers.Concatenate(
+        axis=-1,
+        name="decoder_skip_1",
+    )([x, low_2])
+    x = conv_norm_act(
+        x,
+        filters=128,
+        kernel_size=3,
+        name="decoder_fuse_1",
+    )
+
+    x = layers.UpSampling2D(
+        size=(2, 2),
+        interpolation="bilinear",
+        name="decoder_upsample_2",
+    )(x)
+    x = conv_norm_act(
+        x,
+        filters=64,
+        kernel_size=3,
+        name="decoder_up_2",
+    )
+
+    x = layers.Concatenate(
+        axis=-1,
+        name="decoder_skip_2",
+    )([x, low_1])
+    x = conv_norm_act(
+        x,
+        filters=64,
+        kernel_size=3,
+        name="decoder_fuse_2",
+    )
+
+    output_image = layers.Conv2D(
+        filters=OUTPUT_CHANNELS,
+        kernel_size=7,
+        padding="same",
+        activation="tanh",
+        kernel_initializer=KERNEL_INITIALIZER,
+        name="generator_output",
+    )(x)
+
+    return Model(
+        inputs=[input_image, condition],
+        outputs=output_image,
+        name="ICGAN_Generator",
+    )
+
+
+def build_patch_discriminator(height, width, name):
+    input_image = layers.Input(
+        shape=(height, width, INPUT_CHANNELS),
+        name=f"{name}_input_image",
+    )
+    condition = layers.Input(
+        shape=(height, width, CONDITION_CHANNELS),
+        name=f"{name}_condition",
+    )
+    output_image = layers.Input(
+        shape=(height, width, OUTPUT_CHANNELS),
+        name=f"{name}_output_image",
+    )
+
+    # 1 + 2 + 1 = 4 个输入通道
+    x = layers.Concatenate(
+        axis=-1,
+        name=f"{name}_input_fusion",
+    )([input_image, condition, output_image])
+
+    x = conv_norm_act(
+        x,
+        filters=64,
+        kernel_size=4,
+        strides=2,
+        use_norm=False,
+        name=f"{name}_block_1",
+    )
+    x = conv_norm_act(
+        x,
+        filters=128,
+        kernel_size=4,
+        strides=2,
+        name=f"{name}_block_2",
+    )
+    x = conv_norm_act(
+        x,
+        filters=256,
+        kernel_size=4,
+        strides=2,
+        name=f"{name}_block_3",
+    )
+
+    x = conv_norm_act(
+        x,
+        filters=913,
+        kernel_size=4,
+        strides=1,
+        name=f"{name}_block_4",
+    )
+
+    logits = layers.Conv2D(
+        filters=1,
+        kernel_size=4,
+        padding="same",
+        kernel_initializer=KERNEL_INITIALIZER,
+        name=f"{name}_logits",
+    )(x)
+
+    return Model(
+        inputs=[input_image, condition, output_image],
+        outputs=logits,
+        name=name,
+    )
+
+
+def build_multiscale_discriminator():
+    input_image = layers.Input(
+        shape=(128, 128, INPUT_CHANNELS),
+        name="discriminator_input_image",
+    )
+    condition = layers.Input(
+        shape=(128, 128, CONDITION_CHANNELS),
+        name="discriminator_condition",
+    )
+    output_image = layers.Input(
+        shape=(128, 128, OUTPUT_CHANNELS),
+        name="discriminator_output_image",
+    )
+
+    d1 = build_patch_discriminator(128, 128, "D_scale_1")
+    d2 = build_patch_discriminator(64, 64, "D_scale_2")
+    d3 = build_patch_discriminator(32, 32, "D_scale_3")
+
+    input_half = layers.AveragePooling2D(
+        2, 2, padding="same", name="input_half"
+    )(input_image)
+    condition_half = layers.AveragePooling2D(
+        2, 2, padding="same", name="condition_half"
+    )(condition)
+    output_half = layers.AveragePooling2D(
+        2, 2, padding="same", name="output_half"
+    )(output_image)
+
+    input_quarter = layers.AveragePooling2D(
+        4, 4, padding="same", name="input_quarter"
+    )(input_image)
+    condition_quarter = layers.AveragePooling2D(
+        4, 4, padding="same", name="condition_quarter"
+    )(condition)
+    output_quarter = layers.AveragePooling2D(
+        4, 4, padding="same", name="output_quarter"
+    )(output_image)
+
+    logits_1 = d1([input_image, condition, output_image])
+    logits_2 = d2([input_half, condition_half, output_half])
+    logits_3 = d3([
+        input_quarter,
+        condition_quarter,
+        output_quarter,
+    ])
+
+    return Model(
+        inputs=[input_image, condition, output_image],
+        outputs=[logits_1, logits_2, logits_3],
+        name="ICGAN_MultiScaleDiscriminator",
+    )
+
+
+def generator_adversarial_loss(fake_logits):
+    losses = [
+        BCE(tf.ones_like(logits), logits)
+        for logits in fake_logits
+    ]
+    return tf.add_n(losses) / float(len(losses))
+
+
+def discriminator_loss(real_logits, fake_logits):
+    losses = []
+
+    for real, fake in zip(real_logits, fake_logits):
+        real_loss = BCE(tf.ones_like(real), real)
+        fake_loss = BCE(tf.zeros_like(fake), fake)
+        losses.append(real_loss + fake_loss)
+
+    return tf.add_n(losses) / float(len(losses))
+
+
+def create_gaussian_kernel(size=11, sigma=3.0, channels=1):
+    coords = tf.range(size, dtype=tf.float32)
+    coords = coords - tf.cast(size - 1, tf.float32) / 2.0
+
+    kernel_1d = tf.exp(
+        -(coords ** 2) / (2.0 * sigma ** 2)
+    )
+    kernel_1d = kernel_1d / tf.reduce_sum(kernel_1d)
+
+    kernel_2d = tf.tensordot(kernel_1d, kernel_1d, axes=0)
+    kernel_2d = kernel_2d[:, :, None, None]
+
+    return tf.tile(kernel_2d, [1, 1, channels, 1])
+
+
+GAUSSIAN_KERNEL = create_gaussian_kernel(
+    channels=OUTPUT_CHANNELS
+)
+
+
+def gaussian_blur(image):
+    return tf.nn.depthwise_conv2d(
+        input=image,
+        filter=GAUSSIAN_KERNEL,
+        strides=[1, 1, 1, 1],
+        padding="SAME",
+    )
+
+
+def l1_loss(generated, target):
+    return tf.reduce_mean(tf.abs(generated - target))
+
+
+def low_frequency_loss(generated, target):
+    generated_blur = gaussian_blur(generated)
+    target_blur = gaussian_blur(target)
+    return tf.reduce_mean(
+        tf.abs(generated_blur - target_blur)
+    )
+
+
+def edge_loss(generated, target):
+    generated_edges = tf.image.sobel_edges(generated)
+    target_edges = tf.image.sobel_edges(target)
+    return tf.reduce_mean(
+        tf.abs(generated_edges - target_edges)
+    )
+
+
+class ICGAN(Model):
+    def __init__(self, generator, discriminator):
+        super().__init__()
+        self.generator = generator
+        self.discriminator = discriminator
+
+        self.g_optimizer = None
+        self.d_optimizer = None
+
+        self.g_loss_metric = tf.keras.metrics.Mean(name="g_loss")
+        self.d_loss_metric = tf.keras.metrics.Mean(name="d_loss")
+        self.adv_metric = tf.keras.metrics.Mean(name="adv_loss")
+        self.l1_metric = tf.keras.metrics.Mean(name="l1_loss")
+        self.low_metric = tf.keras.metrics.Mean(name="low_frequency_loss")
+        self.edge_metric = tf.keras.metrics.Mean(name="edge_loss")
+
+    def compile(self, g_optimizer, d_optimizer, **kwargs):
+        super().compile(**kwargs)
+        self.g_optimizer = g_optimizer
+        self.d_optimizer = d_optimizer
+
+    @property
+    def metrics(self):
+        return [
+            self.g_loss_metric,
+            self.d_loss_metric,
+            self.adv_metric,
+            self.l1_metric,
+            self.low_metric,
+            self.edge_metric,
+        ]
+
+    def train_step(self, data):
+        (input_image, condition), target_image = data
+
+        # -------------------------
+        with tf.GradientTape() as g_tape:
+            generated_image = self.generator(
+                [input_image, condition],
+                training=True,
+            )
+
+            fake_logits = self.discriminator(
+                [input_image, condition, generated_image],
+                training=True,
+            )
+
+            adv = generator_adversarial_loss(fake_logits)
+            l1 = l1_loss(generated_image, target_image)
+            low = low_frequency_loss(
+                generated_image,
+                target_image,
+            )
+            edge = edge_loss(generated_image, target_image)
+
+            g_loss = (
+                adv
+                + LAMBDA_L1 * l1
+                + LAMBDA_LOW_FREQUENCY * low
+                + LAMBDA_EDGE * edge
+            )
+
+        g_gradients = g_tape.gradient(
+            g_loss,
+            self.generator.trainable_variables,
+        )
+        g_pairs = [
+            (g, v)
+            for g, v in zip(
+                g_gradients,
+                self.generator.trainable_variables,
+            )
+            if g is not None
+        ]
+        self.g_optimizer.apply_gradients(g_pairs)
+
+        # -------------------------
+        generated_image = tf.stop_gradient(generated_image)
+
+        with tf.GradientTape() as d_tape:
+            real_logits = self.discriminator(
+                [input_image, condition, target_image],
+                training=True,
+            )
+            fake_logits = self.discriminator(
+                [input_image, condition, generated_image],
+                training=True,
+            )
+
+            d_loss = discriminator_loss(
+                real_logits,
+                fake_logits,
+            )
+
+        d_gradients = d_tape.gradient(
+            d_loss,
+            self.discriminator.trainable_variables,
+        )
+        d_pairs = [
+            (g, v)
+            for g, v in zip(
+                d_gradients,
+                self.discriminator.trainable_variables,
+            )
+            if g is not None
+        ]
+        self.d_optimizer.apply_gradients(d_pairs)
+
+        self.g_loss_metric.update_state(g_loss)
+        self.d_loss_metric.update_state(d_loss)
+        self.adv_metric.update_state(adv)
+        self.l1_metric.update_state(l1)
+        self.low_metric.update_state(low)
+        self.edge_metric.update_state(edge)
+
+        return {
+            metric.name: metric.result()
+            for metric in self.metrics
+        }
+
+
+def normalize_to_tanh(array, source_range="zero_one"):
+    array = np.asarray(array, dtype=np.float32)
+
+    if source_range == "zero_one":
+        array = array * 2.0 - 1.0
+    elif source_range == "zero_255":
+        array = array / 127.5 - 1.0
+    elif source_range == "minus_one_one":
+        pass
+    else:
+        raise ValueError(
+            "source_range 必须为 zero_one、zero_255 或 minus_one_one"
+        )
+
+    return np.clip(array, -1.0, 1.0)
+
+
+def make_dataset(
+    input_array,
+    condition_array,
+    target_array,
+    batch_size=4,
+    training=True,
+    source_range="zero_one",
+):
+    input_array = np.asarray(input_array, dtype=np.float32)
+    condition_array = np.asarray(condition_array, dtype=np.float32)
+    target_array = np.asarray(target_array, dtype=np.float32)
+
+    assert input_array.shape[1:] == (128, 128, 1)
+    assert condition_array.shape[1:] == (128, 128, 2)
+    assert target_array.shape[1:] == (128, 128, 1)
+
+    input_array = normalize_to_tanh(input_array, source_range)
+    condition_array = normalize_to_tanh(
+        condition_array,
+        source_range,
+    )
+    target_array = normalize_to_tanh(target_array, source_range)
+
+    dataset = tf.data.Dataset.from_tensor_slices(
+        (
+            (input_array, condition_array),
+            target_array,
+        )
+    )
+
+    if training:
+        dataset = dataset.shuffle(len(input_array))
+
+    return dataset.batch(batch_size).prefetch(AUTOTUNE)
+
+
+def create_model():
+    generator = build_generator()
+    discriminator = build_multiscale_discriminator()
+
+    print("Generator 参数量:")
+    print(f"  {generator.count_params():,}")
+    print(f"  {generator.count_params() / 1e6:.2f}M")
+
+    print("Discriminator 参数量:")
+    print(f"  {discriminator.count_params():,}")
+    print(f"  {discriminator.count_params() / 1e6:.2f}M")
+
+    test_input = tf.random.normal((2, 128, 128, 1))
+    test_condition = tf.random.normal((2, 128, 128, 2))
+
+    test_output = generator(
+        [test_input, test_condition],
+        training=False,
+    )
+    test_logits = discriminator(
+        [test_input, test_condition, test_output],
+        training=False,
+    )
+
+    print("Generator 输出尺寸:", test_output.shape)
+    print(
+        "Discriminator 输出尺寸:",
+        [x.shape for x in test_logits],
+    )
+
+    model = ICGAN(generator, discriminator)
+    model.compile(
+        g_optimizer=optimizers.Adam(
+            learning_rate=LEARNING_RATE_G,
+            beta_1=BETA_1,
+        ),
+        d_optimizer=optimizers.Adam(
+            learning_rate=LEARNING_RATE_D,
+            beta_1=BETA_1,
+        ),
+    )
+
+    return model
+
+
+class SaveWeights(tf.keras.callbacks.Callback):
+    def __init__(self, directory="checkpoints", interval=10):
+        super().__init__()
+        self.directory = Path(directory)
+        self.interval = interval
+        self.directory.mkdir(parents=True, exist_ok=True)
+
+    def on_epoch_end(self, epoch, logs=None):
+        epoch_id = epoch + 1
+        if epoch_id % self.interval == 0:
+            path = self.directory / (
+                f"generator_epoch_{epoch_id:04d}.weights.h5"
+            )
+            self.model.generator.save_weights(str(path))
+            print(f"已保存：{path}")
+
+
+if __name__ == "__main__":
+    model = create_model()
+
