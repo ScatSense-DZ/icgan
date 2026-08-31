@@ -1,2 +1,2 @@
-# T2B-cGAN
-Implementation of our T2B-cGAN
+# icgan
+Implementation of icgan
